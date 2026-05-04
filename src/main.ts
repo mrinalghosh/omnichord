@@ -304,8 +304,8 @@ function drawWaveformGlyph(
 ) {
   const cx = p.x * canvas.width;
   const cy = p.y * canvas.height;
-  const halfW = 32; // glyph half-width
-  const halfH = 14; // glyph half-height
+  const halfW = 22; // glyph half-width
+  const halfH = 10; // glyph half-height
   const color = pinched ? "#fd79a8" : "#a29bfe";
 
   ctx.save();
