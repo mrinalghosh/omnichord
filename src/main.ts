@@ -166,8 +166,6 @@ function pinchAmount(hand: Hand): number {
 const PINCH_ON = 0.18;
 const PINCH_OFF = 0.32;
 let chordPinched = false;
-let waveLabel: string = "triangle";
-let waveLabelUntil = 0;
 
 function chordCellFromDisplay(
   dx: number,
@@ -297,6 +295,64 @@ function drawHandDot(p: Vec2, color: string, label?: string) {
   }
 }
 
+// Draw one period of the given waveform as a glyph centered on p. Used as the
+// chord-hand cursor so the user always sees which oscillator the strum will use.
+function drawWaveformGlyph(
+  p: Vec2,
+  wave: "triangle" | "sine" | "sawtooth" | "square",
+  pinched: boolean
+) {
+  const cx = p.x * canvas.width;
+  const cy = p.y * canvas.height;
+  const halfW = 32; // glyph half-width
+  const halfH = 14; // glyph half-height
+  const color = pinched ? "#fd79a8" : "#a29bfe";
+
+  ctx.save();
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 16;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 3.5;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.beginPath();
+
+  const x0 = cx - halfW;
+  const x1 = cx + halfW;
+
+  if (wave === "sine") {
+    const steps = 48;
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const x = x0 + t * (x1 - x0);
+      const y = cy - Math.sin(t * Math.PI * 2) * halfH;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+  } else if (wave === "triangle") {
+    // Up to peak at 1/4, down through 3/4, back to baseline.
+    ctx.moveTo(x0, cy);
+    ctx.lineTo(x0 + halfW * 0.5, cy - halfH);
+    ctx.lineTo(cx + halfW * 0.5, cy + halfH);
+    ctx.lineTo(x1, cy);
+  } else if (wave === "sawtooth") {
+    // Ramp up over the full period, vertical drop at the end.
+    ctx.moveTo(x0, cy + halfH);
+    ctx.lineTo(x1 - 0.001, cy - halfH);
+    ctx.lineTo(x1, cy + halfH);
+  } else {
+    // square: half-period high, half-period low.
+    ctx.moveTo(x0, cy + halfH);
+    ctx.lineTo(x0, cy - halfH);
+    ctx.lineTo(cx, cy - halfH);
+    ctx.lineTo(cx, cy + halfH);
+    ctx.lineTo(x1, cy + halfH);
+    ctx.lineTo(x1, cy - halfH);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
 function handleStrum(dx: number) {
   const band = strumBandFromX(dx, lastStrumBand);
   const now = performance.now();
@@ -405,8 +461,7 @@ function frame() {
       const p = pinchAmount(h);
       if (!chordPinched && p < PINCH_ON) {
         chordPinched = true;
-        waveLabel = cycleWaveform();
-        waveLabelUntil = now + 1200;
+        cycleWaveform();
       } else if (chordPinched && p > PINCH_OFF) {
         chordPinched = false;
       }
@@ -458,7 +513,7 @@ function frame() {
       heldCellKey = null;
       setHeldChord(null);
     }
-    drawHandDot(chord.smoothed, chordPinched ? "#fd79a8" : "#a29bfe", "chord");
+    drawWaveformGlyph(chord.smoothed, getWaveform(), chordPinched);
   } else if (heldCellKey !== null) {
     heldCellKey = null;
     setHeldChord(null);
@@ -473,15 +528,6 @@ function frame() {
     setVibrato(0);
   }
 
-  // Brief on-screen confirmation when the waveform changes.
-  if (performance.now() < waveLabelUntil) {
-    ctx.fillStyle = "rgba(253, 121, 168, 0.95)";
-    ctx.font = "600 28px -apple-system, system-ui, sans-serif";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(`～ ${waveLabel}`, canvas.width / 2, canvas.height - 40);
-  }
-
   requestAnimationFrame(frame);
 }
 
@@ -493,7 +539,6 @@ startBtn.addEventListener("click", async () => {
     await setupCamera();
     await setupLandmarker();
     requestWakeLock();
-    waveLabel = getWaveform();
     startOverlay.classList.add("hidden");
     requestAnimationFrame(frame);
   } catch (err) {
