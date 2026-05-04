@@ -4,13 +4,11 @@ import {
   type HandLandmarkerResult,
 } from "@mediapipe/tasks-vision";
 import { GRID, ROWS, COLS, chordAt, type Chord } from "./chords";
-import { initAudio, pluck, setHeldChord } from "./audio";
+import { initAudio, pluck, setHeldChord, cycleWaveform, getWaveform } from "./audio";
 
 const video = document.getElementById("video") as HTMLVideoElement;
 const canvas = document.getElementById("overlay") as HTMLCanvasElement;
 const ctx = canvas.getContext("2d")!;
-const chordNameEl = document.getElementById("chord-name")!;
-const statusEl = document.getElementById("status")!;
 const startOverlay = document.getElementById("start-overlay")!;
 const startBtn = document.getElementById("start-btn") as HTMLButtonElement;
 
@@ -105,6 +103,24 @@ function handCentroid(hand: Hand): Vec2 {
 function indexTip(hand: Hand): Vec2 {
   return hand.landmarks[8];
 }
+
+// Pinch = thumb tip (4) close to index tip (8), measured relative to hand size
+// (wrist 0 → middle MCP 9) so it's distance-invariant.
+function pinchAmount(hand: Hand): number {
+  const thumb = hand.landmarks[4];
+  const index = hand.landmarks[8];
+  const wrist = hand.landmarks[0];
+  const mcp = hand.landmarks[9];
+  const handSize = Math.hypot(mcp.x - wrist.x, mcp.y - wrist.y) || 0.0001;
+  const d = Math.hypot(thumb.x - index.x, thumb.y - index.y);
+  return d / handSize; // ~0.2 when pinched, ~1+ when open
+}
+
+const PINCH_ON = 0.45;
+const PINCH_OFF = 0.7;
+let chordPinched = false;
+let waveLabel: string = "triangle";
+let waveLabelUntil = 0;
 
 function chordCellFromDisplay(
   dx: number,
@@ -287,8 +303,20 @@ function frame() {
     if (chordHand) {
       const c = handCentroid(chordHand);
       chordSmoothed = smooth(chordSmoothed, { x: mirrorX(c.x), y: c.y });
+
+      // Pinch gesture (with hysteresis) toggles the strum oscillator waveform
+      // on the rising edge.
+      const p = pinchAmount(chordHand);
+      if (!chordPinched && p < PINCH_ON) {
+        chordPinched = true;
+        waveLabel = cycleWaveform();
+        waveLabelUntil = performance.now() + 1200;
+      } else if (chordPinched && p > PINCH_OFF) {
+        chordPinched = false;
+      }
     } else {
       chordSmoothed = null;
+      chordPinched = false;
     }
 
     if (strumHand) {
@@ -326,7 +354,7 @@ function frame() {
         setHeldChord(null);
       }
     }
-    drawHandDot(chordSmoothed, "#a29bfe", "chord");
+    drawHandDot(chordSmoothed, chordPinched ? "#fd79a8" : "#a29bfe", "chord");
   } else {
     if (heldCellKey !== null) {
       heldCellKey = null;
@@ -339,11 +367,15 @@ function frame() {
     drawHandDot(strumSmoothed, "#ffeaa7", "strum");
   }
 
-  chordNameEl.textContent = currentChord.label;
-  statusEl.textContent =
-    (chordSmoothed ? "● chord" : "○ chord") +
-    "   " +
-    (strumSmoothed ? "● strum" : "○ strum");
+  // Brief on-screen confirmation when the waveform changes.
+  if (performance.now() < waveLabelUntil) {
+    ctx.fillStyle = "rgba(253, 121, 168, 0.95)";
+    ctx.font = "600 28px -apple-system, system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(`～ ${waveLabel}`, canvas.width / 2, canvas.height - 40);
+  }
+
   requestAnimationFrame(frame);
 }
 
@@ -352,16 +384,13 @@ startBtn.addEventListener("click", async () => {
   startBtn.textContent = "Loading…";
   try {
     await initAudio();
-    statusEl.textContent = "audio ready · loading camera…";
     await setupCamera();
-    statusEl.textContent = "camera ready · loading hand model…";
     await setupLandmarker();
-    statusEl.textContent = "ready";
+    waveLabel = getWaveform();
     startOverlay.classList.add("hidden");
     requestAnimationFrame(frame);
   } catch (err) {
-    statusEl.textContent = `error: ${(err as Error).message}`;
+    startBtn.textContent = `Error: ${(err as Error).message} — Retry`;
     startBtn.disabled = false;
-    startBtn.textContent = "Retry";
   }
 });
