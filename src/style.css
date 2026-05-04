@@ -7,6 +7,11 @@ html, body {
   color: #e8e8f0;
   font-family: -apple-system, system-ui, sans-serif;
   overflow: hidden;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
 }
 #video {
   position: fixed;
@@ -38,6 +43,16 @@ html, body {
   font-size: 64px;
   font-weight: 700;
   letter-spacing: 2px;
+}
+#start-overlay p {
+  padding: 0 env(safe-area-inset-right) 0 env(safe-area-inset-left);
+}
+@media (orientation: portrait) {
+  #chord-name { font-size: 40px; }
+  #start-btn { font-size: 18px; padding: 12px 28px; }
+}
+@media (orientation: portrait) and (max-width: 480px) {
+  #start-overlay p { font-size: 14px; }
 }
 #status {
   font-size: 13px;

@@ -73,8 +73,13 @@ window.addEventListener("resize", resizeCanvas);
 resizeCanvas();
 
 async function setupCamera() {
+  // Mobile browsers downscale anyway, and lower res keeps the GPU delegate
+  // hitting frame rate. Desktop still gets the higher resolution.
+  const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
   const stream = await navigator.mediaDevices.getUserMedia({
-    video: { width: 1280, height: 720, facingMode: "user" },
+    video: isMobile
+      ? { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" }
+      : { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
     audio: false,
   });
   video.srcObject = stream;
@@ -90,15 +95,30 @@ async function setupLandmarker() {
   const fileset = await FilesetResolver.forVisionTasks(
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
   );
-  landmarker = await HandLandmarker.createFromOptions(fileset, {
-    baseOptions: {
-      modelAssetPath:
-        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-      delegate: "GPU",
-    },
-    runningMode: "VIDEO",
-    numHands: 2,
-  });
+  const modelAssetPath =
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+  try {
+    landmarker = await HandLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath, delegate: "GPU" },
+      runningMode: "VIDEO",
+      numHands: 2,
+    });
+  } catch {
+    // Some mobile browsers (esp. iOS Safari) reject the GPU delegate.
+    landmarker = await HandLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath, delegate: "CPU" },
+      runningMode: "VIDEO",
+      numHands: 2,
+    });
+  }
+}
+
+async function requestWakeLock() {
+  try {
+    await (navigator as any).wakeLock?.request("screen");
+  } catch {
+    // Non-fatal: phone may dim during play, but everything still works.
+  }
 }
 
 function mirrorX(x: number): number {
@@ -472,6 +492,7 @@ startBtn.addEventListener("click", async () => {
     await initAudio();
     await setupCamera();
     await setupLandmarker();
+    requestWakeLock();
     waveLabel = getWaveform();
     startOverlay.classList.add("hidden");
     requestAnimationFrame(frame);
