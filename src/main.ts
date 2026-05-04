@@ -4,7 +4,14 @@ import {
   type HandLandmarkerResult,
 } from "@mediapipe/tasks-vision";
 import { GRID, ROWS, COLS, chordAt, type Chord } from "./chords";
-import { initAudio, pluck, setHeldChord, cycleWaveform, getWaveform } from "./audio";
+import {
+  initAudio,
+  pluck,
+  setHeldChord,
+  cycleWaveform,
+  getWaveform,
+  setVibrato,
+} from "./audio";
 
 const video = document.getElementById("video") as HTMLVideoElement;
 const canvas = document.getElementById("overlay") as HTMLCanvasElement;
@@ -31,12 +38,24 @@ const HYSTERESIS = 0.22;
 const GRID_FRACTION = 0.6;
 
 type Vec2 = { x: number; y: number };
-let chordSmoothed: Vec2 | null = null;
-let strumSmoothed: Vec2 | null = null;
+
+// Per-role state. Identity is matched across frames by nearest-centroid so
+// MediaPipe re-ordering can't swap chord/strum mid-play. Each role has a
+// 150ms grace window so a single dropped detection frame doesn't release the
+// pad or re-fire pinch.
+type RoleState = {
+  smoothed: Vec2 | null;
+  lastCentroid: Vec2 | null;
+  lastSeenAt: number;
+};
+const chord: RoleState = { smoothed: null, lastCentroid: null, lastSeenAt: 0 };
+const strum: RoleState = { smoothed: null, lastCentroid: null, lastSeenAt: 0 };
+const GRACE_MS = 150;
 
 let currentChord: Chord = chordAt(0, 1);
 let currentCell: { row: number; col: number } | null = { row: 0, col: 1 };
 let heldCellKey: string | null = null;
+let lastStrumNoteIdx: number | null = null;
 
 function smooth(prev: Vec2 | null, next: Vec2): Vec2 {
   if (!prev) return next;
@@ -104,20 +123,28 @@ function indexTip(hand: Hand): Vec2 {
   return hand.landmarks[8];
 }
 
-// Pinch = thumb tip (4) close to index tip (8), measured relative to hand size
-// (wrist 0 → middle MCP 9) so it's distance-invariant.
+// Pinch = thumb tip (4) close to index tip (8), normalized by the hand's
+// bounding-box diagonal (rotation-robust — wrist→MCP collapses when the palm
+// is edge-on to the camera).
 function pinchAmount(hand: Hand): number {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of hand.landmarks) {
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  }
+  const handSize = Math.hypot(maxX - minX, maxY - minY) || 0.0001;
   const thumb = hand.landmarks[4];
   const index = hand.landmarks[8];
-  const wrist = hand.landmarks[0];
-  const mcp = hand.landmarks[9];
-  const handSize = Math.hypot(mcp.x - wrist.x, mcp.y - wrist.y) || 0.0001;
   const d = Math.hypot(thumb.x - index.x, thumb.y - index.y);
-  return d / handSize; // ~0.2 when pinched, ~1+ when open
+  return d / handSize;
 }
 
-const PINCH_ON = 0.45;
-const PINCH_OFF = 0.7;
+// Thresholds tuned for bbox-diagonal normalization (open hand ≈ 0.5–0.8,
+// pinched ≈ 0.05–0.15).
+const PINCH_ON = 0.18;
+const PINCH_OFF = 0.32;
 let chordPinched = false;
 let waveLabel: string = "triangle";
 let waveLabelUntil = 0;
@@ -215,6 +242,23 @@ function drawGrid() {
   }
 }
 
+function drawStrumDot(p: Vec2, vibrato: number) {
+  const x = p.x * canvas.width;
+  const y = p.y * canvas.height;
+  // Pulsing halo whose size grows with vibrato depth.
+  if (vibrato > 0.02) {
+    const phase = (performance.now() / 1000) * (4.5 + vibrato * 3.5) * Math.PI * 2;
+    const wobble = Math.sin(phase);
+    const r = 18 + vibrato * (14 + wobble * 6);
+    ctx.strokeStyle = `rgba(255, 234, 167, ${0.25 + vibrato * 0.4})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  drawHandDot(p, "#ffeaa7", "strum");
+}
+
 function drawHandDot(p: Vec2, color: string, label?: string) {
   const x = p.x * canvas.width;
   const y = p.y * canvas.height;
@@ -247,19 +291,24 @@ function handleStrum(dx: number) {
     const dt = Math.max(1, now - lastStrumT);
     const dxAbs = Math.abs(dx - (lastStrumX ?? dx));
     const speed = dxAbs / dt;
-    const velocity = Math.min(1, 0.4 + speed * 50);
+    // Cap velocity below 1 to leave headroom for the chorus + delay + reverb
+    // chain on aggressive strums.
+    const velocity = Math.min(0.85, 0.4 + speed * 50);
 
     const notes = currentChord.strum;
     let cursor = lastStrumBand;
     while (cursor !== band) {
       cursor += dir;
-      // Map band index → note index, ascending strum walks up the chord
-      // tones across all octaves.
       const noteIdx = Math.min(
         notes.length - 1,
         Math.max(0, Math.floor((cursor / STRUM_BANDS) * notes.length))
       );
-      pluck(notes[noteIdx], velocity);
+      // Skip duplicate-pitch plucks: with 16 bands across ~9 chord tones,
+      // adjacent bands often resolve to the same note index.
+      if (noteIdx !== lastStrumNoteIdx) {
+        pluck(notes[noteIdx], velocity);
+        lastStrumNoteIdx = noteIdx;
+      }
     }
     lastStrumBand = band;
     lastStrumX = dx;
@@ -272,71 +321,109 @@ function frame() {
     requestAnimationFrame(frame);
     return;
   }
-  const t = performance.now();
   let result: HandLandmarkerResult | null = null;
   if (video.currentTime !== lastVideoTime) {
     lastVideoTime = video.currentTime;
-    result = landmarker.detectForVideo(video, t);
+    result = landmarker.detectForVideo(video, performance.now());
   }
 
+  const now = performance.now();
+  const chordFresh = chord.lastSeenAt > 0 && now - chord.lastSeenAt < GRACE_MS;
+  const strumFresh = strum.lastSeenAt > 0 && now - strum.lastSeenAt < GRACE_MS;
+
   // Update target positions only on fresh detections; smoothed positions are
-  // continuous and rendered every animation frame, which kills visual flicker.
+  // continuous and rendered every animation frame.
   if (result) {
     const hands = extractHands(result);
+    const centroids = hands.map(handCentroid);
 
-    let chordHand: Hand | null = null;
-    let strumHand: Hand | null = null;
+    // Match detected hands to roles by nearest previous centroid. This keeps
+    // chord/strum identities stable across MediaPipe's frame-to-frame
+    // re-ordering and small position swaps.
+    let chordIdx = -1;
+    let strumIdx = -1;
+    const dist = (a: Vec2, b: Vec2) => Math.hypot(a.x - b.x, a.y - b.y);
+
     if (hands.length === 1) {
-      const palm = handCentroid(hands[0]);
-      if (palm.y < GRID_FRACTION) chordHand = hands[0];
-      else strumHand = hands[0];
+      const c = centroids[0];
+      const dC = chordFresh && chord.lastCentroid ? dist(c, chord.lastCentroid) : Infinity;
+      const dS = strumFresh && strum.lastCentroid ? dist(c, strum.lastCentroid) : Infinity;
+      if (dC === Infinity && dS === Infinity) {
+        // Cold start: assign by y-zone.
+        if (c.y < GRID_FRACTION) chordIdx = 0;
+        else strumIdx = 0;
+      } else if (dC <= dS) chordIdx = 0;
+      else strumIdx = 0;
     } else if (hands.length >= 2) {
-      // Hand whose palm is higher on the screen (smaller y) drives the chord;
-      // the other hand strums regardless of its y position.
-      const sorted = [...hands].sort(
-        (a, b) => handCentroid(a).y - handCentroid(b).y
-      );
-      chordHand = sorted[0];
-      strumHand = sorted[1];
+      if (chordFresh && strumFresh && chord.lastCentroid && strum.lastCentroid) {
+        // 2-way assignment: pick the pairing with the smaller total distance.
+        const d00 =
+          dist(centroids[0], chord.lastCentroid) +
+          dist(centroids[1], strum.lastCentroid);
+        const d01 =
+          dist(centroids[0], strum.lastCentroid) +
+          dist(centroids[1], chord.lastCentroid);
+        if (d00 <= d01) { chordIdx = 0; strumIdx = 1; }
+        else { chordIdx = 1; strumIdx = 0; }
+      } else {
+        // Cold start: top hand → chord, lower hand → strum.
+        const order = [0, 1].sort(
+          (a, b) => centroids[a].y - centroids[b].y
+        );
+        chordIdx = order[0];
+        strumIdx = order[1];
+      }
     }
 
-    if (chordHand) {
-      const c = handCentroid(chordHand);
-      chordSmoothed = smooth(chordSmoothed, { x: mirrorX(c.x), y: c.y });
+    if (chordIdx >= 0) {
+      const h = hands[chordIdx];
+      const c = centroids[chordIdx];
+      chord.lastCentroid = c;
+      chord.lastSeenAt = now;
+      chord.smoothed = smooth(chord.smoothed, { x: mirrorX(c.x), y: c.y });
 
-      // Pinch gesture (with hysteresis) toggles the strum oscillator waveform
-      // on the rising edge.
-      const p = pinchAmount(chordHand);
+      const p = pinchAmount(h);
       if (!chordPinched && p < PINCH_ON) {
         chordPinched = true;
         waveLabel = cycleWaveform();
-        waveLabelUntil = performance.now() + 1200;
+        waveLabelUntil = now + 1200;
       } else if (chordPinched && p > PINCH_OFF) {
         chordPinched = false;
       }
-    } else {
-      chordSmoothed = null;
-      chordPinched = false;
     }
 
-    if (strumHand) {
-      const tip = indexTip(strumHand);
-      strumSmoothed = smooth(strumSmoothed, { x: mirrorX(tip.x), y: tip.y });
-    } else {
-      strumSmoothed = null;
-      lastStrumBand = null;
-      lastStrumX = null;
+    if (strumIdx >= 0) {
+      const h = hands[strumIdx];
+      const c = centroids[strumIdx];
+      const tip = indexTip(h);
+      strum.lastCentroid = c;
+      strum.lastSeenAt = now;
+      strum.smoothed = smooth(strum.smoothed, { x: mirrorX(tip.x), y: tip.y });
     }
+  }
+
+  // Apply grace period: only clear role state once it's been missing > GRACE_MS.
+  if (chord.lastSeenAt > 0 && now - chord.lastSeenAt >= GRACE_MS) {
+    chord.smoothed = null;
+    chord.lastCentroid = null;
+    chordPinched = false;
+  }
+  if (strum.lastSeenAt > 0 && now - strum.lastSeenAt >= GRACE_MS) {
+    strum.smoothed = null;
+    strum.lastCentroid = null;
+    lastStrumBand = null;
+    lastStrumX = null;
+    lastStrumNoteIdx = null;
   }
 
   // Drive logic and rendering from the smoothed positions every frame.
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   drawGrid();
 
-  if (chordSmoothed) {
+  if (chord.smoothed) {
     const cell = chordCellFromDisplay(
-      chordSmoothed.x,
-      chordSmoothed.y,
+      chord.smoothed.x,
+      chord.smoothed.y,
       currentCell
     );
     if (cell) {
@@ -347,24 +434,23 @@ function frame() {
         heldCellKey = key;
         setHeldChord(currentChord.pad);
       }
-    } else {
-      // Hand drifted out of the grid area — release the pad.
-      if (heldCellKey !== null) {
-        heldCellKey = null;
-        setHeldChord(null);
-      }
-    }
-    drawHandDot(chordSmoothed, chordPinched ? "#fd79a8" : "#a29bfe", "chord");
-  } else {
-    if (heldCellKey !== null) {
+    } else if (heldCellKey !== null) {
       heldCellKey = null;
       setHeldChord(null);
     }
+    drawHandDot(chord.smoothed, chordPinched ? "#fd79a8" : "#a29bfe", "chord");
+  } else if (heldCellKey !== null) {
+    heldCellKey = null;
+    setHeldChord(null);
   }
 
-  if (strumSmoothed) {
-    handleStrum(strumSmoothed.x);
-    drawHandDot(strumSmoothed, "#ffeaa7", "strum");
+  if (strum.smoothed) {
+    handleStrum(strum.smoothed.x);
+    const vibAmount = Math.max(0, Math.min(1, (strum.smoothed.y - 0.4) / 0.55));
+    setVibrato(vibAmount);
+    drawStrumDot(strum.smoothed, vibAmount);
+  } else {
+    setVibrato(0);
   }
 
   // Brief on-screen confirmation when the waveform changes.

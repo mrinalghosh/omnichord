@@ -8,6 +8,7 @@ let pad: Tone.PolySynth | null = null; // sustained chord pad
 let reverb: Tone.Reverb | null = null;
 let chorus: Tone.Chorus | null = null;
 let delay: Tone.FeedbackDelay | null = null;
+let vibrato: Tone.Vibrato | null = null;
 let heldPad: number[] | null = null;
 let currentWave: Waveform = "triangle";
 
@@ -23,10 +24,14 @@ export async function initAudio() {
     .connect(delay)
     .start();
 
+  // Vibrato: pitch-modulating effect inserted before chorus on the strum chain.
+  // Depth is the modulation amount (0..1, where 1 ≈ ±50 cents at default).
+  vibrato = new Tone.Vibrato({ frequency: 5.5, depth: 0 }).connect(chorus);
+
   synth = new Tone.PolySynth(Tone.Synth, {
     oscillator: { type: currentWave },
     envelope: { attack: 0.06, decay: 0.4, sustain: 0.4, release: 2.4 },
-  }).connect(chorus);
+  }).connect(vibrato);
   synth.volume.value = -12;
 
   pad = new Tone.PolySynth(Tone.Synth, {
@@ -50,6 +55,15 @@ export function cycleWaveform(): Waveform {
 
 export function getWaveform(): Waveform {
   return currentWave;
+}
+
+// amount: 0 (off) → 1 (full depth). Frequency speeds up slightly with depth so
+// deep vibrato also feels more agitated, not just wider.
+export function setVibrato(amount: number) {
+  if (!vibrato) return;
+  const a = Math.min(1, Math.max(0, amount));
+  vibrato.depth.rampTo(a * 0.6, 0.05);
+  vibrato.frequency.rampTo(4.5 + a * 3.5, 0.05);
 }
 
 export function midiToFreq(midi: number): number {
