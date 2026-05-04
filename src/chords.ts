@@ -1,32 +1,38 @@
-// 3x3 chord grid in C major. Row 0 = top of screen.
-// Layout chosen so the most common chords (I, IV, V, vi) sit in the easy
-// middle/top zones, with color chords on the bottom row.
 export type Chord = {
   label: string;
-  // MIDI note numbers, root + chord tones, ordered low → high for strumming.
-  notes: number[];
+  // Pad voicing: low-register held chord (root+3rd+5th near middle C).
+  pad: number[];
+  // Strum voicing: chord tones repeated across multiple octaves, low → high.
+  strum: number[];
 };
 
-// Helper: build a chord from a root midi + intervals.
-const c = (label: string, root: number, intervals: number[]): Chord => ({
-  label,
-  notes: intervals.map((i) => root + i),
-});
+// Build a chord from a root MIDI note + chord-tone intervals (within one octave).
+// Strum array tiles those tones across `octaves` octaves starting at the root.
+const c = (
+  label: string,
+  root: number,
+  intervals: number[],
+  octaves = 3
+): Chord => {
+  const pad = [root, ...intervals.slice(1).map((i) => root + i)];
+  const strum: number[] = [];
+  for (let o = 0; o < octaves; o++) {
+    for (const i of intervals) strum.push(root + i + o * 12);
+  }
+  return { label, pad, strum };
+};
 
-const MAJ = [0, 4, 7, 12];
-const MIN = [0, 3, 7, 12];
-const DIM = [0, 3, 6, 12];
-const DOM7 = [0, 4, 7, 10, 12];
-const MAJ7 = [0, 4, 7, 11, 12];
+const MAJ = [0, 4, 7];
+const MIN = [0, 3, 7];
+const DIM = [0, 3, 6];
+const DOM7 = [0, 4, 7, 10];
+const MAJ7 = [0, 4, 7, 11];
 
-// MIDI: C4 = 60
+// MIDI: C4 = 60. Pad voicings stay near middle C; strums span 3 octaves above.
 export const GRID: Chord[][] = [
-  // top row
-  [c("F",  65, MAJ),  c("C",  60, MAJ),  c("G",  67, MAJ)],
-  // middle row
-  [c("Dm", 62, MIN),  c("Am", 57, MIN),  c("Em", 64, MIN)],
-  // bottom row
-  [c("G7", 67, DOM7), c("Cmaj7", 60, MAJ7), c("Bdim", 59, DIM)],
+  [c("F",  53, MAJ),  c("C",  48, MAJ),  c("G",  55, MAJ)],
+  [c("Dm", 50, MIN),  c("Am", 45, MIN),  c("Em", 52, MIN)],
+  [c("G7", 55, DOM7), c("Cmaj7", 48, MAJ7), c("Bdim", 47, DIM)],
 ];
 
 export const ROWS = GRID.length;

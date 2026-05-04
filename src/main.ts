@@ -4,7 +4,7 @@ import {
   type HandLandmarkerResult,
 } from "@mediapipe/tasks-vision";
 import { GRID, ROWS, COLS, chordAt, type Chord } from "./chords";
-import { initAudio, pluck, previewChord } from "./audio";
+import { initAudio, pluck, setHeldChord } from "./audio";
 
 const video = document.getElementById("video") as HTMLVideoElement;
 const canvas = document.getElementById("overlay") as HTMLCanvasElement;
@@ -17,35 +17,36 @@ const startBtn = document.getElementById("start-btn") as HTMLButtonElement;
 let landmarker: HandLandmarker | null = null;
 let lastVideoTime = -1;
 
-const STRUM_BANDS = 8;
+const STRUM_BANDS = 16;
 let lastStrumBand: number | null = null;
 let lastStrumX: number | null = null;
 let lastStrumT = 0;
 
-// Smoothed positions (EMA) so cell/band selection doesn't flicker on jitter.
-const SMOOTH = 0.35; // 0=no smoothing, 1=frozen
-let chordSmoothed: { x: number; y: number } | null = null;
-let strumSmoothed: { x: number; y: number } | null = null;
+// Heavy smoothing — feels like a damped follow rather than 1:1 tracking.
+const SMOOTH = 0.28;
+const HYSTERESIS = 0.22;
 
-// Hysteresis: require the smoothed position to be at least this fraction of a
-// cell/band past the boundary before switching.
-const HYSTERESIS = 0.18;
+// Layout: chord grid takes the top GRID_FRACTION; strum strip is the bottom.
+// Note: strum *triggers* don't require the hand to be in the strum strip — the
+// strip is only a visual reference. The strum hand's x-coordinate is tracked
+// wherever it is on screen.
+const GRID_FRACTION = 0.6;
 
-function smooth(
-  prev: { x: number; y: number } | null,
-  next: { x: number; y: number }
-): { x: number; y: number } {
+type Vec2 = { x: number; y: number };
+let chordSmoothed: Vec2 | null = null;
+let strumSmoothed: Vec2 | null = null;
+
+let currentChord: Chord = chordAt(0, 1);
+let currentCell: { row: number; col: number } | null = { row: 0, col: 1 };
+let heldCellKey: string | null = null;
+
+function smooth(prev: Vec2 | null, next: Vec2): Vec2 {
   if (!prev) return next;
   return {
     x: prev.x + (next.x - prev.x) * SMOOTH,
     y: prev.y + (next.y - prev.y) * SMOOTH,
   };
 }
-
-// Currently selected chord (sticky once chosen). Default to C major.
-let currentChord: Chord = chordAt(1, 1); // Am middle — but we'll update immediately
-currentChord = chordAt(0, 1); // C
-let currentCell: { row: number; col: number } | null = { row: 0, col: 1 };
 
 function resizeCanvas() {
   canvas.width = window.innerWidth;
@@ -83,50 +84,27 @@ async function setupLandmarker() {
   });
 }
 
-// In MediaPipe normalized coords, x grows left→right of the *raw* camera frame.
-// Because we mirror the display (scaleX(-1)), what the user sees on the left side
-// of the screen is x > 0.5 in raw coords. We mirror x for all logic so it matches
-// what the user sees.
 function mirrorX(x: number): number {
   return 1 - x;
 }
 
-type Hand = {
-  landmarks: { x: number; y: number; z: number }[];
-  handedness: "Left" | "Right"; // as labeled by MediaPipe (the user's actual hand)
-};
+type Hand = { landmarks: Vec2[] };
 
 function extractHands(result: HandLandmarkerResult): Hand[] {
-  const hands: Hand[] = [];
-  for (let i = 0; i < result.landmarks.length; i++) {
-    const lm = result.landmarks[i];
-    // MediaPipe handedness is from the camera's perspective. Since we mirror the
-    // display, MediaPipe's "Left" appears on the user's left side of the screen,
-    // which is actually their right hand (selfie view). Flip the label.
-    const rawLabel = result.handednesses[i]?.[0]?.categoryName ?? "Right";
-    const flipped: "Left" | "Right" = rawLabel === "Left" ? "Right" : "Left";
-    hands.push({
-      landmarks: lm.map((p) => ({ x: p.x, y: p.y, z: p.z })),
-      handedness: flipped,
-    });
-  }
-  return hands;
+  return result.landmarks.map((lm) => ({
+    landmarks: lm.map((p) => ({ x: p.x, y: p.y })),
+  }));
 }
 
-function handCentroid(hand: Hand): { x: number; y: number } {
-  // Use wrist (0) + middle MCP (9) midpoint as a stable palm center.
+function handCentroid(hand: Hand): Vec2 {
   const w = hand.landmarks[0];
   const m = hand.landmarks[9];
   return { x: (w.x + m.x) / 2, y: (w.y + m.y) / 2 };
 }
 
-function indexTip(hand: Hand): { x: number; y: number } {
+function indexTip(hand: Hand): Vec2 {
   return hand.landmarks[8];
 }
-
-// Layout: grid occupies the top GRID_FRACTION of the screen, strum bands occupy
-// the bottom (1 - GRID_FRACTION).
-const GRID_FRACTION = 0.6;
 
 function chordCellFromDisplay(
   dx: number,
@@ -134,18 +112,14 @@ function chordCellFromDisplay(
   current: { row: number; col: number } | null
 ): { row: number; col: number } | null {
   if (dy > GRID_FRACTION) return null;
-  const gx = dx * COLS; // continuous column index
+  const gx = dx * COLS;
   const gy = (dy / GRID_FRACTION) * ROWS;
   let col = Math.min(COLS - 1, Math.max(0, Math.floor(gx)));
   let row = Math.min(ROWS - 1, Math.max(0, Math.floor(gy)));
-
-  // Hysteresis: if we have a current cell, require crossing the boundary by
-  // HYSTERESIS before switching to the new cell.
   if (current) {
-    const fracX = gx - current.col; // distance into current col, 0..1 if same col
+    const fracX = gx - current.col;
     const fracY = gy - current.row;
     if (col !== current.col) {
-      // Want to switch column. Demand the new cell is entered by HYSTERESIS.
       if (col < current.col && fracX > -HYSTERESIS) col = current.col;
       else if (col > current.col && fracX < 1 + HYSTERESIS) col = current.col;
     }
@@ -157,12 +131,7 @@ function chordCellFromDisplay(
   return { row, col };
 }
 
-function strumBandFromDisplay(
-  dx: number,
-  dy: number,
-  current: number | null
-): number | null {
-  if (dy < GRID_FRACTION) return null;
+function strumBandFromX(dx: number, current: number | null): number {
   const gx = dx * STRUM_BANDS;
   let band = Math.min(STRUM_BANDS - 1, Math.max(0, Math.floor(gx)));
   if (current !== null && band !== current) {
@@ -180,7 +149,6 @@ function drawGrid() {
   const cellW = w / COLS;
   const cellH = gridH / ROWS;
 
-  // chord grid (top)
   for (let r = 0; r < ROWS; r++) {
     for (let c = 0; c < COLS; c++) {
       const x = c * cellW;
@@ -203,21 +171,19 @@ function drawGrid() {
     }
   }
 
-  // strum bands (bottom)
   const stripY = gridH;
   const stripH = h - gridH;
   ctx.fillStyle = "rgba(255, 234, 167, 0.04)";
   ctx.fillRect(0, stripY, w, stripH);
   for (let i = 1; i < STRUM_BANDS; i++) {
     const x = (i / STRUM_BANDS) * w;
-    ctx.strokeStyle = "rgba(255,255,255,0.10)";
+    ctx.strokeStyle = "rgba(255,255,255,0.08)";
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(x, stripY);
     ctx.lineTo(x, h);
     ctx.stroke();
   }
-  // divider
   ctx.strokeStyle = "rgba(255,255,255,0.25)";
   ctx.lineWidth = 2;
   ctx.beginPath();
@@ -225,19 +191,24 @@ function drawGrid() {
   ctx.lineTo(w, stripY);
   ctx.stroke();
 
-  ctx.fillStyle = "rgba(255,255,255,0.35)";
-  ctx.font = "12px -apple-system, system-ui, sans-serif";
-  ctx.textAlign = "center";
-  ctx.fillText("strum ←→", w / 2, stripY + stripH / 2);
+  // Highlight the current strum band column for feedback.
+  if (lastStrumBand !== null) {
+    const x = (lastStrumBand / STRUM_BANDS) * w;
+    ctx.fillStyle = "rgba(255, 234, 167, 0.12)";
+    ctx.fillRect(x, stripY, w / STRUM_BANDS, stripH);
+  }
 }
 
-function drawHandDot(dx: number, dy: number, color: string, label?: string) {
-  const x = dx * canvas.width;
-  const y = dy * canvas.height;
+function drawHandDot(p: Vec2, color: string, label?: string) {
+  const x = p.x * canvas.width;
+  const y = p.y * canvas.height;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 18;
   ctx.fillStyle = color;
   ctx.beginPath();
   ctx.arc(x, y, 14, 0, Math.PI * 2);
   ctx.fill();
+  ctx.shadowBlur = 0;
   if (label) {
     ctx.fillStyle = "#fff";
     ctx.font = "12px -apple-system, system-ui, sans-serif";
@@ -246,14 +217,9 @@ function drawHandDot(dx: number, dy: number, color: string, label?: string) {
   }
 }
 
-function handleStrum(dx: number, dy: number) {
-  const band = strumBandFromDisplay(dx, dy, lastStrumBand);
+function handleStrum(dx: number) {
+  const band = strumBandFromX(dx, lastStrumBand);
   const now = performance.now();
-  if (band === null) {
-    lastStrumBand = null;
-    lastStrumX = null;
-    return;
-  }
   if (lastStrumBand === null) {
     lastStrumBand = band;
     lastStrumX = dx;
@@ -261,22 +227,23 @@ function handleStrum(dx: number, dy: number) {
     return;
   }
   if (band !== lastStrumBand) {
-    // Crossed at least one band boundary. Trigger one note per crossing.
     const dir = band > lastStrumBand ? 1 : -1;
     const dt = Math.max(1, now - lastStrumT);
-    const dxAbs = Math.abs((dx - (lastStrumX ?? dx)));
-    const speed = dxAbs / dt; // display units / ms
-    const velocity = Math.min(1, 0.35 + speed * 60);
+    const dxAbs = Math.abs(dx - (lastStrumX ?? dx));
+    const speed = dxAbs / dt;
+    const velocity = Math.min(1, 0.4 + speed * 50);
 
-    const notes = currentChord.notes;
+    const notes = currentChord.strum;
     let cursor = lastStrumBand;
     while (cursor !== band) {
       cursor += dir;
-      // Pick a note from the chord, cycling. Ascending strum walks up.
-      const idx = ((cursor % notes.length) + notes.length) % notes.length;
-      const noteMidi =
-        dir > 0 ? notes[idx] : notes[notes.length - 1 - idx];
-      pluck(noteMidi, velocity);
+      // Map band index → note index, ascending strum walks up the chord
+      // tones across all octaves.
+      const noteIdx = Math.min(
+        notes.length - 1,
+        Math.max(0, Math.floor((cursor / STRUM_BANDS) * notes.length))
+      );
+      pluck(notes[noteIdx], velocity);
     }
     lastStrumBand = band;
     lastStrumX = dx;
@@ -296,64 +263,87 @@ function frame() {
     result = landmarker.detectForVideo(video, t);
   }
 
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  drawGrid();
-
+  // Update target positions only on fresh detections; smoothed positions are
+  // continuous and rendered every animation frame, which kills visual flicker.
   if (result) {
     const hands = extractHands(result);
 
-    // Position-based assignment (ignore MediaPipe handedness, which flips
-    // unreliably under mirrored selfie video). Whichever hand's palm sits on
-    // the display-left half picks the chord; whichever index tip sits on the
-    // display-right half drives the strum.
     let chordHand: Hand | null = null;
     let strumHand: Hand | null = null;
-    for (const h of hands) {
-      const palm = handCentroid(h);
-      if (palm.y < GRID_FRACTION) {
-        if (!chordHand) chordHand = h;
-      } else {
-        if (!strumHand) strumHand = h;
-      }
+    if (hands.length === 1) {
+      const palm = handCentroid(hands[0]);
+      if (palm.y < GRID_FRACTION) chordHand = hands[0];
+      else strumHand = hands[0];
+    } else if (hands.length >= 2) {
+      // Hand whose palm is higher on the screen (smaller y) drives the chord;
+      // the other hand strums regardless of its y position.
+      const sorted = [...hands].sort(
+        (a, b) => handCentroid(a).y - handCentroid(b).y
+      );
+      chordHand = sorted[0];
+      strumHand = sorted[1];
     }
 
     if (chordHand) {
       const c = handCentroid(chordHand);
-      const raw = { x: mirrorX(c.x), y: c.y };
-      chordSmoothed = smooth(chordSmoothed, raw);
-      const cell = chordCellFromDisplay(
-        chordSmoothed.x,
-        chordSmoothed.y,
-        currentCell
-      );
-      if (cell) {
-        const changed =
-          !currentCell ||
-          currentCell.row !== cell.row ||
-          currentCell.col !== cell.col;
-        currentCell = cell;
-        currentChord = chordAt(cell.row, cell.col);
-        if (changed) previewChord(currentChord.notes);
-      }
-      drawHandDot(chordSmoothed.x, chordSmoothed.y, "#a29bfe", "chord");
+      chordSmoothed = smooth(chordSmoothed, { x: mirrorX(c.x), y: c.y });
     } else {
       chordSmoothed = null;
     }
 
     if (strumHand) {
       const tip = indexTip(strumHand);
-      const raw = { x: mirrorX(tip.x), y: tip.y };
-      strumSmoothed = smooth(strumSmoothed, raw);
-      handleStrum(strumSmoothed.x, strumSmoothed.y);
-      drawHandDot(strumSmoothed.x, strumSmoothed.y, "#ffeaa7", "strum");
+      strumSmoothed = smooth(strumSmoothed, { x: mirrorX(tip.x), y: tip.y });
     } else {
+      strumSmoothed = null;
       lastStrumBand = null;
       lastStrumX = null;
-      strumSmoothed = null;
     }
   }
 
+  // Drive logic and rendering from the smoothed positions every frame.
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawGrid();
+
+  if (chordSmoothed) {
+    const cell = chordCellFromDisplay(
+      chordSmoothed.x,
+      chordSmoothed.y,
+      currentCell
+    );
+    if (cell) {
+      currentCell = cell;
+      currentChord = chordAt(cell.row, cell.col);
+      const key = `${cell.row},${cell.col}`;
+      if (key !== heldCellKey) {
+        heldCellKey = key;
+        setHeldChord(currentChord.pad);
+      }
+    } else {
+      // Hand drifted out of the grid area — release the pad.
+      if (heldCellKey !== null) {
+        heldCellKey = null;
+        setHeldChord(null);
+      }
+    }
+    drawHandDot(chordSmoothed, "#a29bfe", "chord");
+  } else {
+    if (heldCellKey !== null) {
+      heldCellKey = null;
+      setHeldChord(null);
+    }
+  }
+
+  if (strumSmoothed) {
+    handleStrum(strumSmoothed.x);
+    drawHandDot(strumSmoothed, "#ffeaa7", "strum");
+  }
+
   chordNameEl.textContent = currentChord.label;
+  statusEl.textContent =
+    (chordSmoothed ? "● chord" : "○ chord") +
+    "   " +
+    (strumSmoothed ? "● strum" : "○ strum");
   requestAnimationFrame(frame);
 }
 
