@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Omnichord — hand controlled</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="start-overlay">
+      <button id="start-btn">Start</button>
+      <p>Allow camera access. Left hand picks a chord (3×3 grid on the left). Right hand strums by sweeping across the bands on the right.</p>
+    </div>
+    <video id="video" playsinline></video>
+    <canvas id="overlay"></canvas>
+    <div id="hud">
+      <div id="chord-name">—</div>
+      <div id="status"></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
